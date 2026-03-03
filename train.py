@@ -8,15 +8,16 @@ os.environ.setdefault("TMPDIR", _fallback_tmp)
 import random
 import time
 import yaml
+import numpy as np
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
 from tqdm import tqdm
 
-from model import SimpleNet, ResNet20, ResNet18CIFAR, WideResNet28_2
+from model import SimpleNet, ResNet20, ResNet18CIFAR, WideResNet28_2, WideResNet28_10
 
 # Load config (YAML for easy editing)
 with open('config.yaml', 'r') as f:
@@ -51,7 +52,7 @@ class CutoutTransform:
         return img
 
 
-def get_transforms(augment: bool = False, cutout_size: int = 0):
+def get_transforms(augment: bool = False, cutout_size: int = 0, use_randaugment: bool = False):
     """Get transforms: augment=True for training, False for val/test."""
     base = [
         transforms.ToTensor(),
@@ -61,8 +62,10 @@ def get_transforms(augment: bool = False, cutout_size: int = 0):
         aug_list = [
             transforms.RandomCrop(32, padding=4),
             transforms.RandomHorizontalFlip(),
-            *base,
         ]
+        if use_randaugment:
+            aug_list.append(transforms.RandAugment(num_ops=2, magnitude=9))
+        aug_list.extend(base)
         if cutout_size > 0:
             aug_list.append(CutoutTransform(size=cutout_size))
         return transforms.Compose(aug_list)
@@ -86,21 +89,23 @@ class _SubsetWithTransform(torch.utils.data.Dataset):
         return x, y
 
 
-def get_loaders():
+def get_loaders(use_randaugment=False):
+    """Build dataloaders. use_randaugment overrides config for phased training."""
     data_dir = config['paths']['data_dir']
     os.makedirs(data_dir, exist_ok=True)
 
     cutout_size = int(config['hyperparameters'].get('cutout_size', 0))
-    transform_train = get_transforms(augment=True, cutout_size=cutout_size)
+    if use_randaugment:
+        cutout_size = 0  # Don't stack RandAugment + Cutout
+    transform_train = get_transforms(augment=True, cutout_size=cutout_size, use_randaugment=use_randaugment)
     transform_eval = get_transforms(augment=False)
 
-    # Load raw (no transform) so we can apply different transforms for train vs val
-    # Same root = single download; train=True/False selects split
-    dataset_train_full = datasets.CIFAR10(
+    # Standard CIFAR split: train=50k, test=10k (no random val split)
+    dataset_train = datasets.CIFAR10(
         root=data_dir,
         train=True,
         download=True,
-        transform=None,
+        transform=transform_train,
     )
     dataset_test = datasets.CIFAR10(
         root=data_dir,
@@ -108,15 +113,6 @@ def get_loaders():
         download=True,
         transform=transform_eval,
     )
-
-    val_split = config['hyperparameters'].get('val_split', 0.1)
-    n_total = len(dataset_train_full)
-    n_val = int(n_total * val_split)
-    n_train = n_total - n_val
-    subset_train, subset_val = random_split(dataset_train_full, [n_train, n_val])
-
-    dataset_train = _SubsetWithTransform(subset_train, transform_train)
-    dataset_val = _SubsetWithTransform(subset_val, transform_eval)
 
     hp = config['hyperparameters']
     num_workers = hp.get('num_workers', 0)
@@ -130,9 +126,28 @@ def get_loaders():
         kw['prefetch_factor'] = hp.get('prefetch_factor', 2)
 
     dataloader_train = DataLoader(dataset_train, shuffle=True, **kw)
-    dataloader_val = DataLoader(dataset_val, shuffle=False, **kw)
     dataloader_test = DataLoader(dataset_test, shuffle=False, **kw)
-    return dataloader_train, dataloader_val, dataloader_test
+    return dataloader_train, dataloader_test
+
+
+def cutmix_data(inputs, labels, alpha=1.0):
+    """CutMix augmentation. Returns mixed inputs, label_a, label_b, lam."""
+    lam = np.random.beta(alpha, alpha)
+    batch_size = inputs.size(0)
+    index = torch.randperm(batch_size, device=inputs.device)
+    W, H = inputs.size(3), inputs.size(2)
+    cut_rat = np.sqrt(1.0 - lam)
+    cut_w = int(W * cut_rat)
+    cut_h = int(H * cut_rat)
+    cx = np.random.randint(W)
+    cy = np.random.randint(H)
+    bbx1 = np.clip(cx - cut_w // 2, 0, W)
+    bbx2 = np.clip(cx + cut_w // 2, 0, W)
+    bby1 = np.clip(cy - cut_h // 2, 0, H)
+    bby2 = np.clip(cy + cut_h // 2, 0, H)
+    inputs[:, :, bby1:bby2, bbx1:bbx2] = inputs[index, :, bby1:bby2, bbx1:bbx2]
+    lam = 1.0 - ((bbx2 - bbx1) * (bby2 - bby1) / (W * H))
+    return inputs, labels, labels[index], lam
 
 
 class EMA:
@@ -175,22 +190,48 @@ def evaluate(model, dataloader, criterion, device, use_tta=False):
     return total_loss / total, 100 * correct / total
 
 
-def train(model, dataloader_train, dataloader_val, criterion, optimizer, scheduler, device, use_amp, scaler=None, ema=None):
+def train(model, dataloader_train_a, dataloader_train_b, dataloader_eval, criterion, optimizer, scheduler, device, use_amp, scaler=None, ema=None, cutmix_alpha=0.0, start_randaugment_epoch=30, start_cutmix_epoch=30, model_path=None, use_tta=False):
     model.train()
     epochs = config['hyperparameters']['epochs']
     hp = config['hyperparameters']
+    use_cutmix = cutmix_alpha > 0
+    cutmix_prob = float(config.get('cutmix_prob', 0.5))
+    cutmix_alpha_end = float(config.get('cutmix_alpha_end', 1.0))
+    cutmix_alpha_ramp_epochs = int(config.get('cutmix_alpha_ramp_epochs', 0))
+    best_acc = -1.0
 
     for epoch in range(epochs):
+        # Phase A: RandomCrop+Flip only. Phase B: RandAugment + CutMix
+        dataloader_train = dataloader_train_b if epoch >= start_randaugment_epoch else dataloader_train_a
+        epochs_since_cutmix = max(0, epoch - start_cutmix_epoch)
+        if cutmix_alpha_ramp_epochs <= 0 or epochs_since_cutmix >= cutmix_alpha_ramp_epochs:
+            eff_cutmix_alpha = cutmix_alpha_end
+        else:
+            eff_cutmix_alpha = cutmix_alpha + (cutmix_alpha_end - cutmix_alpha) * (epochs_since_cutmix / cutmix_alpha_ramp_epochs)
+        use_amp_this_epoch = use_amp and device.type == 'cuda'
+
         running_loss = 0.0
         with tqdm(dataloader_train, desc=f"Epoch {epoch+1}/{epochs}", leave=True, unit="batch") as pbar:
             for i, (inputs, labels) in enumerate(pbar):
                 inputs, labels = inputs.to(device), labels.to(device)
+
+                do_cutmix = False
+                lam = 1.0
+                labels_b = labels
+                if use_cutmix and (epoch >= start_cutmix_epoch) and (np.random.rand() < cutmix_prob):
+                    do_cutmix = True
+                    inputs = inputs.clone()
+                    inputs, labels, labels_b, lam = cutmix_data(inputs, labels, eff_cutmix_alpha)
+
                 optimizer.zero_grad()
 
-                if use_amp:
+                if use_amp_this_epoch:
                     with torch.amp.autocast(device_type=device.type, dtype=torch.float16):
                         outputs = model(inputs)
-                        loss = criterion(outputs, labels)
+                        if do_cutmix:
+                            loss = lam * criterion(outputs, labels) + (1.0 - lam) * criterion(outputs, labels_b)
+                        else:
+                            loss = criterion(outputs, labels)
                     if not torch.isfinite(loss):
                         print("Non-finite loss detected, skipping batch")
                         continue
@@ -201,7 +242,10 @@ def train(model, dataloader_train, dataloader_val, criterion, optimizer, schedul
                     scaler.update()
                 else:
                     outputs = model(inputs)
-                    loss = criterion(outputs, labels)
+                    if do_cutmix:
+                        loss = lam * criterion(outputs, labels) + (1.0 - lam) * criterion(outputs, labels_b)
+                    else:
+                        loss = criterion(outputs, labels)
                     if not torch.isfinite(loss):
                         print("Non-finite loss detected, skipping batch")
                         continue
@@ -220,8 +264,15 @@ def train(model, dataloader_train, dataloader_val, criterion, optimizer, schedul
 
         lr = optimizer.param_groups[0]["lr"]
         avg_train_loss = running_loss / len(dataloader_train)
-        val_loss, val_acc = evaluate(model, dataloader_val, criterion, device)
-        print(f"Epoch {epoch+1} | LR: {lr:.6f} | Train loss: {avg_train_loss:.3f} | Val loss: {val_loss:.3f} | Val acc: {val_acc:.2f}%")
+        eval_loss, eval_acc = evaluate(model, dataloader_eval, criterion, device, use_tta=use_tta)
+        print(f"Epoch {epoch+1} | LR: {lr:.6f} | Train loss: {avg_train_loss:.3f} | Eval loss: {eval_loss:.3f} | Eval acc: {eval_acc:.2f}%")
+
+        # Save best checkpoint by eval accuracy
+        if model_path and eval_acc > best_acc:
+            best_acc = eval_acc
+            os.makedirs(os.path.dirname(model_path) or '.', exist_ok=True)
+            torch.save(model.state_dict(), model_path)
+            print(f"  -> Saved best checkpoint (acc: {eval_acc:.2f}%)")
 
     print('Finished Training')
 
@@ -251,6 +302,9 @@ def build_model(device):
     elif model_name == 'WideResNet28_2':
         dropout = float(config['hyperparameters'].get('dropout', 0.0))
         model = WideResNet28_2(num_classes=10, dropout=dropout).to(device)
+    elif model_name == 'WideResNet28_10':
+        dropout = float(config['hyperparameters'].get('dropout', 0.0))
+        model = WideResNet28_10(num_classes=10, dropout=dropout).to(device)
     else:
         model = SimpleNet().to(device)
 
@@ -268,7 +322,7 @@ def build_optimizer(model):
     if name == 'AdamW':
         return optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     momentum = float(hp.get('momentum', 0.9))
-    return optim.SGD(model.parameters(), lr=lr, momentum=momentum, weight_decay=weight_decay)
+    return optim.SGD(model.parameters(), lr=lr, momentum=momentum, weight_decay=weight_decay, nesterov=True)
 
 
 def build_scheduler(optimizer):
@@ -297,9 +351,11 @@ def main():
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
     print(f'Using device: {device}')
 
-    dataloader_train, dataloader_val, dataloader_test = get_loaders()
+    dataloader_train_a, dataloader_test = get_loaders(use_randaugment=False)
+    dataloader_train_b, _ = get_loaders(use_randaugment=True)
 
     model = build_model(device)
+    print("MODEL:", config.get("model"), "PARAMS:", sum(p.numel() for p in model.parameters()))
 
     label_smoothing = float(config['hyperparameters'].get('label_smoothing', 0.0))
     criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
@@ -314,9 +370,12 @@ def main():
     ema = EMA(model, decay=float(config.get('ema_decay', 0.999))) if use_ema else None
 
     use_tta = config.get('use_tta', False)
+    cutmix_alpha = float(config.get('cutmix_alpha', 0.0))
+    start_randaugment_epoch = int(config.get('start_randaugment_epoch', 30))
+    start_cutmix_epoch = int(config.get('start_cutmix_epoch', 30))
 
     t0 = time.perf_counter()
-    train(model, dataloader_train, dataloader_val, criterion, optimizer, scheduler, device, use_amp, scaler, ema)
+    train(model, dataloader_train_a, dataloader_train_b, dataloader_test, criterion, optimizer, scheduler, device, use_amp, scaler, ema, cutmix_alpha=cutmix_alpha, start_randaugment_epoch=start_randaugment_epoch, start_cutmix_epoch=start_cutmix_epoch, model_path=config['paths']['model_path'], use_tta=use_tta)
     train_time = time.perf_counter() - t0
 
     eval_model = model
@@ -327,6 +386,7 @@ def main():
     print(f'Test loss: {test_loss:.3f} | Test acc: {test_acc:.2f}%')
     print(f'Total training time: {train_time:.1f}s')
 
+    # Best checkpoint already saved during training; save final model
     os.makedirs(os.path.dirname(config['paths']['model_path']) or '.', exist_ok=True)
     torch.save(model.state_dict(), config['paths']['model_path'])
     print(f"Model saved to {config['paths']['model_path']}")

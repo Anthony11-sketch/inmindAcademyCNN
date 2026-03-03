@@ -147,6 +147,38 @@ class WideResNet28_2(nn.Module):
         return x
 
 
+class WideResNet28_10(nn.Module):
+    """WideResNet-28-10 for CIFAR-10. ~36M params, often needed for 98%."""
+
+    def __init__(self, num_classes=10, dropout=0.0):
+        super().__init__()
+        self.conv1 = nn.Conv2d(3, 16, 3, stride=1, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(16)
+        self.layer1 = self._make_layer(16, 160, 4, stride=1, dropout=dropout)
+        self.layer2 = self._make_layer(160, 320, 4, stride=2, dropout=dropout)
+        self.layer3 = self._make_layer(320, 640, 4, stride=2, dropout=dropout)
+        self.avgpool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Linear(640, num_classes)
+
+    def _make_layer(self, in_ch, out_ch, num_blocks, stride, dropout):
+        strides = [stride] + [1] * (num_blocks - 1)
+        layers = []
+        for s in strides:
+            layers.append(_WideBlock(in_ch, out_ch, s, dropout))
+            in_ch = out_ch
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        x = F.relu(self.bn1(self.conv1(x)))
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.avgpool(x)
+        x = torch.flatten(x, 1)
+        x = self.fc(x)
+        return x
+
+
 class ResNet20(nn.Module):
     """ResNet-20 for CIFAR-10 (32x32). Efficient and typically outperforms SimpleNet."""
 

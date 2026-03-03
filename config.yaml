@@ -2,27 +2,33 @@ seed: 42
 paths:
   data_dir: 'data/cifar10'
   model_path: 'weights/checkpoint.pth'
-# SimpleNet | ResNet20 | ResNet18CIFAR | WideResNet28_2 (~95% with good aug)
+# Target ~98%: WideResNet28_10 (~36M params) or WideResNet28_2 (~1.5M)
 model: 'WideResNet28_2'
 hyperparameters:
-  epochs: 180
+  epochs: 300
   batch_size: 128
-  val_split: 0.1
   optimizer: 'SGD'
-  lr: 0.05  # lowered from 0.1 to avoid NaNs; try 0.03 if still unstable
+  lr: 0.05
   momentum: 0.9
   weight_decay: 5e-4
-  label_smoothing: 0.1
-  cutout_size: 16
+  label_smoothing: 0.0
+  cutout_size: 0
   dropout: 0.3
-  scheduler: 'cosine'  # or 'step' for MultiStepLR
-  lr_milestones: [60, 120]  # used when scheduler: step (drop LR ×0.1 at these epochs)
+  scheduler: 'cosine'
+  lr_milestones: [60, 120, 160]
   warmup_epochs: 5
-  num_workers: 4
+  num_workers: 8
   pin_memory: true
   persistent_workers: true
-  prefetch_factor: 2
-use_amp: false
+  prefetch_factor: 4
+# Phase A (0-30): RandomCrop+Flip only. Phase B (30+): RandAugment + CutMix
+start_randaugment_epoch: 30
+start_cutmix_epoch: 30
+cutmix_alpha: 0.5
+cutmix_alpha_end: 0.5
+cutmix_alpha_ramp_epochs: 0
+cutmix_prob: 0.25
+use_amp: true
 use_compile: false
 use_ema: true
 ema_decay: 0.999
