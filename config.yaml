@@ -1,13 +1,22 @@
-hyperparameters:
-  epochs: 10
-  batch_size: 8
-
-  lr: 0.001
-  momentum: 0.9 
-
-  num_workers: 8
-
+seed: 42
 paths:
-  train_dir: 'data/cifar10/train'
-  test_dir: 'data/cifar10/test'
+  data_dir: 'data/cifar10'
   model_path: 'weights/checkpoint.pth'
+model: 'ResNet20'
+hyperparameters:
+  epochs: 50
+  batch_size: 128
+  val_split: 0.1
+  optimizer: 'SGD'
+  lr: 0.05
+  momentum: 0.9
+  weight_decay: 5e-4
+  label_smoothing: 0.05
+  scheduler: 'cosine'
+  warmup_epochs: 3
+  num_workers: 4
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 2
+use_amp: false
+use_compile: false
