@@ -2,21 +2,28 @@ seed: 42
 paths:
   data_dir: 'data/cifar10'
   model_path: 'weights/checkpoint.pth'
-model: 'ResNet20'
+# SimpleNet | ResNet20 | ResNet18CIFAR | WideResNet28_2 (~95% with good aug)
+model: 'WideResNet28_2'
 hyperparameters:
-  epochs: 50
+  epochs: 180
   batch_size: 128
   val_split: 0.1
   optimizer: 'SGD'
-  lr: 0.05
+  lr: 0.05  # lowered from 0.1 to avoid NaNs; try 0.03 if still unstable
   momentum: 0.9
   weight_decay: 5e-4
-  label_smoothing: 0.05
-  scheduler: 'cosine'
-  warmup_epochs: 3
+  label_smoothing: 0.1
+  cutout_size: 16
+  dropout: 0.3
+  scheduler: 'cosine'  # or 'step' for MultiStepLR
+  lr_milestones: [60, 120]  # used when scheduler: step (drop LR ×0.1 at these epochs)
+  warmup_epochs: 5
   num_workers: 4
   pin_memory: true
   persistent_workers: true
   prefetch_factor: 2
 use_amp: false
 use_compile: false
+use_ema: true
+ema_decay: 0.999
+use_tta: true

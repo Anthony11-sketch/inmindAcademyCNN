@@ -1,4 +1,11 @@
 import os
+
+# Ensure a usable temp directory for PyTorch (fixes FileNotFoundError when /tmp is missing/unwritable)
+_fallback_tmp = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".tmp")
+os.makedirs(_fallback_tmp, exist_ok=True)
+os.environ.setdefault("TMPDIR", _fallback_tmp)
+
+import random
 import time
 import yaml
 
@@ -9,7 +16,7 @@ from torch.utils.data import DataLoader, random_split
 from torchvision import datasets, transforms
 from tqdm import tqdm
 
-from model import SimpleNet, ResNet20
+from model import SimpleNet, ResNet20, ResNet18CIFAR, WideResNet28_2
 
 # Load config (YAML for easy editing)
 with open('config.yaml', 'r') as f:
@@ -29,18 +36,36 @@ def set_seed(seed: int):
     torch.backends.cudnn.benchmark = True  # Faster for fixed-size images (fine with same input size per run)
 
 
-def get_transforms(augment: bool = False):
+class CutoutTransform:
+    """Cutout applied after ToTensor+Normalize."""
+
+    def __init__(self, size=16):
+        self.size = size
+
+    def __call__(self, img):
+        c, h, w = img.shape
+        y = random.randint(0, max(0, h - self.size))
+        x = random.randint(0, max(0, w - self.size))
+        img = img.clone()
+        img[:, y : y + self.size, x : x + self.size] = 0.0
+        return img
+
+
+def get_transforms(augment: bool = False, cutout_size: int = 0):
     """Get transforms: augment=True for training, False for val/test."""
     base = [
         transforms.ToTensor(),
         transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2470, 0.2435, 0.2616)),
     ]
     if augment:
-        return transforms.Compose([
+        aug_list = [
             transforms.RandomCrop(32, padding=4),
             transforms.RandomHorizontalFlip(),
             *base,
-        ])
+        ]
+        if cutout_size > 0:
+            aug_list.append(CutoutTransform(size=cutout_size))
+        return transforms.Compose(aug_list)
     return transforms.Compose(base)
 
 
@@ -65,7 +90,8 @@ def get_loaders():
     data_dir = config['paths']['data_dir']
     os.makedirs(data_dir, exist_ok=True)
 
-    transform_train = get_transforms(augment=True)
+    cutout_size = int(config['hyperparameters'].get('cutout_size', 0))
+    transform_train = get_transforms(augment=True, cutout_size=cutout_size)
     transform_eval = get_transforms(augment=False)
 
     # Load raw (no transform) so we can apply different transforms for train vs val
@@ -109,7 +135,25 @@ def get_loaders():
     return dataloader_train, dataloader_val, dataloader_test
 
 
-def evaluate(model, dataloader, criterion, device):
+class EMA:
+    """Exponential Moving Average of model weights."""
+
+    def __init__(self, model, decay=0.999):
+        self.decay = decay
+        self.shadow = {n: p.data.clone() for n, p in model.named_parameters() if p.requires_grad}
+
+    def update(self, model):
+        for n, p in model.named_parameters():
+            if p.requires_grad and n in self.shadow:
+                self.shadow[n].mul_(self.decay).add_(p.data, alpha=1 - self.decay)
+
+    def apply(self, model):
+        for n, p in model.named_parameters():
+            if p.requires_grad and n in self.shadow:
+                p.data.copy_(self.shadow[n])
+
+
+def evaluate(model, dataloader, criterion, device, use_tta=False):
     model.eval()
     total_loss = 0.0
     correct = 0
@@ -117,7 +161,12 @@ def evaluate(model, dataloader, criterion, device):
     with torch.no_grad():
         for images, labels in dataloader:
             images, labels = images.to(device), labels.to(device)
-            outputs = model(images)
+            if use_tta:
+                out1 = model(images)
+                out2 = model(torch.flip(images, [-1]))
+                outputs = (out1 + out2) / 2
+            else:
+                outputs = model(images)
             loss = criterion(outputs, labels)
             total_loss += loss.item() * labels.size(0)
             _, predicted = torch.max(outputs, 1)
@@ -126,7 +175,7 @@ def evaluate(model, dataloader, criterion, device):
     return total_loss / total, 100 * correct / total
 
 
-def train(model, dataloader_train, dataloader_val, criterion, optimizer, scheduler, device, use_amp, scaler=None):
+def train(model, dataloader_train, dataloader_val, criterion, optimizer, scheduler, device, use_amp, scaler=None, ema=None):
     model.train()
     epochs = config['hyperparameters']['epochs']
     hp = config['hyperparameters']
@@ -139,20 +188,29 @@ def train(model, dataloader_train, dataloader_val, criterion, optimizer, schedul
                 optimizer.zero_grad()
 
                 if use_amp:
-                    with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+                    with torch.amp.autocast(device_type=device.type, dtype=torch.float16):
                         outputs = model(inputs)
                         loss = criterion(outputs, labels)
+                    if not torch.isfinite(loss):
+                        print("Non-finite loss detected, skipping batch")
+                        continue
                     scaler.scale(loss).backward()
                     scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
                     scaler.step(optimizer)
                     scaler.update()
                 else:
                     outputs = model(inputs)
                     loss = criterion(outputs, labels)
+                    if not torch.isfinite(loss):
+                        print("Non-finite loss detected, skipping batch")
+                        continue
                     loss.backward()
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
                     optimizer.step()
+
+                if ema is not None:
+                    ema.update(model)
 
                 running_loss += loss.item()
                 pbar.set_postfix({'loss': running_loss / (i + 1)})
@@ -160,9 +218,10 @@ def train(model, dataloader_train, dataloader_val, criterion, optimizer, schedul
         if scheduler is not None:
             scheduler.step()
 
+        lr = optimizer.param_groups[0]["lr"]
         avg_train_loss = running_loss / len(dataloader_train)
         val_loss, val_acc = evaluate(model, dataloader_val, criterion, device)
-        print(f"Epoch {epoch+1} | Train loss: {avg_train_loss:.3f} | Val loss: {val_loss:.3f} | Val acc: {val_acc:.2f}%")
+        print(f"Epoch {epoch+1} | LR: {lr:.6f} | Train loss: {avg_train_loss:.3f} | Val loss: {val_loss:.3f} | Val acc: {val_acc:.2f}%")
 
     print('Finished Training')
 
@@ -187,6 +246,11 @@ def build_model(device):
     model_name = config.get('model', 'SimpleNet')
     if model_name == 'ResNet20':
         model = ResNet20(num_classes=10).to(device)
+    elif model_name == 'ResNet18CIFAR':
+        model = ResNet18CIFAR(num_classes=10).to(device)
+    elif model_name == 'WideResNet28_2':
+        dropout = float(config['hyperparameters'].get('dropout', 0.0))
+        model = WideResNet28_2(num_classes=10, dropout=dropout).to(device)
     else:
         model = SimpleNet().to(device)
 
@@ -210,8 +274,8 @@ def build_optimizer(model):
 def build_scheduler(optimizer):
     hp = config['hyperparameters']
     sched = hp.get('scheduler')
-    epochs = hp['epochs']
-    warmup = hp.get('warmup_epochs', 0)
+    epochs = int(hp['epochs'])
+    warmup = int(hp.get('warmup_epochs', 0))
 
     if sched == 'cosine':
         def lr_lambda(ep):
@@ -221,7 +285,8 @@ def build_scheduler(optimizer):
             return 0.5 * (1 + __import__('math').cos(__import__('math').pi * prog))
         return optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
     if sched == 'step':
-        return optim.lr_scheduler.StepLR(optimizer, step_size=epochs // 3, gamma=0.1)
+        milestones = hp.get('lr_milestones', [60, 120])
+        return optim.lr_scheduler.MultiStepLR(optimizer, milestones=milestones, gamma=0.1)
     return None
 
 
@@ -236,7 +301,7 @@ def main():
 
     model = build_model(device)
 
-    label_smoothing = config['hyperparameters'].get('label_smoothing', 0.0)
+    label_smoothing = float(config['hyperparameters'].get('label_smoothing', 0.0))
     criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
 
     optimizer = build_optimizer(model)
@@ -245,11 +310,20 @@ def main():
     use_amp = config.get('use_amp', False) and device.type == 'cuda'
     scaler = torch.amp.GradScaler('cuda') if use_amp else None
 
+    use_ema = config.get('use_ema', False)
+    ema = EMA(model, decay=float(config.get('ema_decay', 0.999))) if use_ema else None
+
+    use_tta = config.get('use_tta', False)
+
     t0 = time.perf_counter()
-    train(model, dataloader_train, dataloader_val, criterion, optimizer, scheduler, device, use_amp, scaler)
+    train(model, dataloader_train, dataloader_val, criterion, optimizer, scheduler, device, use_amp, scaler, ema)
     train_time = time.perf_counter() - t0
 
-    test_loss, test_acc = evaluate(model, dataloader_test, criterion, device)
+    eval_model = model
+    if ema is not None:
+        ema.apply(model)
+        eval_model = model
+    test_loss, test_acc = evaluate(eval_model, dataloader_test, criterion, device, use_tta=use_tta)
     print(f'Test loss: {test_loss:.3f} | Test acc: {test_acc:.2f}%')
     print(f'Total training time: {train_time:.1f}s')
 
