@@ -2,8 +2,6 @@ seed: 42
 paths:
   data_dir: 'data/cifar10'
   model_path: 'weights/checkpoint.pth'
-# Target ~98%: WideResNet28_10 (~36M params) or WideResNet28_2 (~1.5M)
-model: 'WideResNet28_2'
 hyperparameters:
   epochs: 300
   batch_size: 128
@@ -11,25 +9,25 @@ hyperparameters:
   lr: 0.05
   momentum: 0.9
   weight_decay: 5e-4
-  label_smoothing: 0.0
-  cutout_size: 0
-  dropout: 0.3
-  scheduler: 'cosine'
-  lr_milestones: [60, 120, 160]
+  label_smoothing: 0.0 # prevents overconfidence
+  cutout_size: 0 #robustness 
+  dropout: 0.3 #diable % of some neurons 
+  scheduler: 'cosine' #lr curve 
+  ##lr_milestones: [60, 120, 160]
   warmup_epochs: 5
   num_workers: 8
-  pin_memory: true
-  persistent_workers: true
-  prefetch_factor: 4
+  pin_memory: true #CPU to GPU transfer
+  persistent_workers: true #keep workers alive
+  prefetch_factor: 4 #load next batch while training
 # Phase A (0-30): RandomCrop+Flip only. Phase B (30+): RandAugment + CutMix
-start_randaugment_epoch: 30
-start_cutmix_epoch: 30
-cutmix_alpha: 0.5
+start_randaugment_epoch: 30 
+start_cutmix_epoch: 30 #phase B starts
+cutmix_alpha: 0.5 #mix ratio
 cutmix_alpha_end: 0.5
-cutmix_alpha_ramp_epochs: 0
-cutmix_prob: 0.25
-use_amp: true
-use_compile: false
-use_ema: true
-ema_decay: 0.999
-use_tta: true
+cutmix_alpha_ramp_epochs: 0 #ramp up time
+cutmix_prob: 0.25 #chance of using cutmix
+use_amp: true #mixed precision training for faster inference
+use_compile: false #compile model for faster inference
+use_ema: true #exponential moving average of weights
+ema_decay: 0.999 #decay rate
+use_tta: true #test time augmentation for better accuracy

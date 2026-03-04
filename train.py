@@ -17,7 +17,7 @@ from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
 from tqdm import tqdm
 
-from model import SimpleNet, ResNet20, ResNet18CIFAR, WideResNet28_2, WideResNet28_10
+from model import WideResNet28_2
 
 # Load config (YAML for easy editing)
 with open('config.yaml', 'r') as f:
@@ -294,19 +294,8 @@ def test(model, dataloader_test, device):
 
 
 def build_model(device):
-    model_name = config.get('model', 'SimpleNet')
-    if model_name == 'ResNet20':
-        model = ResNet20(num_classes=10).to(device)
-    elif model_name == 'ResNet18CIFAR':
-        model = ResNet18CIFAR(num_classes=10).to(device)
-    elif model_name == 'WideResNet28_2':
-        dropout = float(config['hyperparameters'].get('dropout', 0.0))
-        model = WideResNet28_2(num_classes=10, dropout=dropout).to(device)
-    elif model_name == 'WideResNet28_10':
-        dropout = float(config['hyperparameters'].get('dropout', 0.0))
-        model = WideResNet28_10(num_classes=10, dropout=dropout).to(device)
-    else:
-        model = SimpleNet().to(device)
+    dropout = float(config['hyperparameters'].get('dropout', 0.0))
+    model = WideResNet28_2(num_classes=10, dropout=dropout).to(device)
 
     if config.get('use_compile', False) and hasattr(torch, 'compile'):
         model = torch.compile(model)
@@ -355,7 +344,7 @@ def main():
     dataloader_train_b, _ = get_loaders(use_randaugment=True)
 
     model = build_model(device)
-    print("MODEL:", config.get("model"), "PARAMS:", sum(p.numel() for p in model.parameters()))
+    print("MODEL: WideResNet28_2 | PARAMS:", sum(p.numel() for p in model.parameters()))
 
     label_smoothing = float(config['hyperparameters'].get('label_smoothing', 0.0))
     criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
